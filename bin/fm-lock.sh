@@ -189,15 +189,29 @@ refuse_live_owner() {  # <recorded-pid>
   exit 1
 }
 
+# A failed native process query is not evidence that the owner has exited.
+# Windows also preserves a live PID whose executable cannot be identified.
+refuse_live_or_unknown_owner() {  # <recorded-pid>
+  if fm_session_lock_windows; then
+    fm_session_lock_inspect "$STATE"
+    case "$FM_LOCK_INSPECT_STATE" in
+      held) refuse_live_owner "$1" ;;
+      unknown|unreadable)
+        echo "error: cannot verify Windows session-lock owner (pid $1); operate read-only until resolved" >&2
+        exit 1 ;;
+    esac
+  elif fm_harness_pid_alive "$1"; then
+    refuse_live_owner "$1"
+  fi
+}
+
 if [ -f "$LOCK" ] && [ ! -L "$LOCK" ]; then
   old=$(cat "$LOCK" 2>/dev/null || true)
   if [ "$old" = "$me" ] || fm_session_lock_owned_by_self "$STATE"; then
     confirm_own_lock "$old"
     old=$(cat "$LOCK" 2>/dev/null || true)
   fi
-  if fm_harness_pid_alive "$old"; then
-    refuse_live_owner "$old"
-  fi
+  refuse_live_or_unknown_owner "$old"
 fi
 
 if ! fm_lock_try_acquire "$CLAIM_LOCK"; then
@@ -219,12 +233,10 @@ if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
     echo "error: session lock is unreadable; operate read-only until resolved" >&2
     exit 1
   }
-  if [ "$old" != "$me" ] && fm_harness_pid_alive "$old"; then
+  if [ "$old" != "$me" ]; then
     fm_session_lock_owned_by_self "$STATE" && confirm_own_lock "$old"
     old=$(cat "$LOCK" 2>/dev/null || true)
-    if [ "$old" != "$me" ] && fm_harness_pid_alive "$old"; then
-      refuse_live_owner "$old"
-    fi
+    [ "$old" = "$me" ] || refuse_live_or_unknown_owner "$old"
   fi
 fi
 # The sidecar goes first: a fresh pid beside a previous session's id would let

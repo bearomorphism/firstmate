@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # tests/fm-session-lock-ancestry.test.sh - session-lock harness identity
 # (bin/fm-session-lock-lib.sh).
+# --windows runs the Windows process-table regressions and native Windows
+# subprocess checks only; the default also keeps the existing POSIX cases.
 #
 # Two layers. The unit cases drive the library's own functions behind a
 # deterministic fake ps, so both platforms' reporting semantics are covered from
@@ -45,7 +47,7 @@ lib_eval() {  # <fakebin> <expression>
   [ -z "${FM_TEST_SESSION_ID:-}" ] || session_env+=("CLAUDE_CODE_SESSION_ID=$FM_TEST_SESSION_ID")
   [ -z "${FM_TEST_CLAUDE_PID:-}" ] || session_env+=("CLAUDE_PID=$FM_TEST_CLAUDE_PID")
   env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID ${session_env[@]+"${session_env[@]}"} \
-    PATH="$fakebin:$PATH" bash -c "
+    OSTYPE=linux-gnu PATH="$fakebin:$PATH" bash -c "
     . \"\$0\"
     kill() { return \${FM_TEST_KILL_RC:-0}; }
     $expr
@@ -1099,6 +1101,160 @@ test_verified_reclaim_keeps_new_sidecar() {
   pass "session-lock: a verified reclaim keeps the new sidecar beside the new pid"
 }
 
+# Windows process-table tests run on every platform; the native subprocess
+# case additionally exercises CIM, quoted paths, PID mapping, and real locks.
+windows_eval() {
+  lib_eval "$1" "OSTYPE=msys; fm_session_windows_msys_ancestry() { printf '900'; }; $2"
+}
+
+test_windows_session_process_table() {
+  local dir fakebin got pid expected rc
+  dir="$TMP_ROOT/windows-table"
+  fakebin=$(fm_fakebin "$dir")
+  mkdir -p "$dir/state"
+  cat > "$fakebin/powershell.exe" <<'SH'
+#!/usr/bin/env bash
+mode= pid=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -Mode) mode=$2; shift 2 ;;
+    -ProcessId) pid=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ "${FM_TEST_WINDOWS_QUERY_FAIL:-0}" = 0 ] || exit 1
+if [ "$mode" = ancestry ]; then
+  printf '900|700|C:/Program Files/Git/usr/bin/bash.exe|-\r\n'
+  case "${FM_TEST_WINDOWS_SHAPE:-pi}" in
+    pi) printf '700|600|C:/Program Files/nodejs/node.exe|C:/Users/Space User/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js\r\n' ;;
+    gap) printf '700|650|C:/Tools/CLAUDE.EXE|-\n650|600|C:/Windows/cmd.exe|-\n' ;;
+    none) printf '700|1|C:/Program Files/nodejs/node.exe|C:/Tools/pipeline.js\n'; exit 0 ;;
+  esac
+  printf '600|1|C:/Tools/claude.exe|-\n'
+else
+  case "$pid" in
+    700) printf '700|600|C:/Program Files/nodejs/node.exe|C:/Users/Space User/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js\n' ;;
+    600) printf '600|1|C:/Tools/claude.exe|-\n' ;;
+    500) printf '500|1|C:/Tools/pipeline.exe|-\n' ;;
+    401) exit 1 ;;
+    402) exit 2 ;;
+    403) printf 'malformed\n' ;;
+    *) exit 3 ;;
+  esac
+fi
+SH
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+exit 99
+SH
+  chmod +x "$fakebin/powershell.exe" "$fakebin/ps"
+
+  got=$(windows_eval "$fakebin" 'fm_session_lock_anchor_pid') || fail 'Windows Pi ancestry was not found'
+  [ "$got" = 700 ] || fail "Windows anchor was $got, expected nearest native PID 700"
+  got=$(FM_TEST_WINDOWS_SHAPE=gap windows_eval "$fakebin" 'fm_harness_ancestry_pid') || fail 'Windows Claude ancestry was not found'
+  [ "$got" = 700 ] || fail 'Windows ancestry crossed a non-harness gap'
+  if FM_TEST_WINDOWS_SHAPE=none windows_eval "$fakebin" 'fm_session_lock_anchor_pid'; then
+    fail 'an ordinary Windows node process claimed a session'
+  fi
+  printf '700\n' > "$dir/state/.lock"
+  windows_eval "$fakebin" "fm_session_lock_owned_by_self '$dir/state'" || fail 'Windows session did not recognize its own lock'
+  printf '600\n' > "$dir/state/.lock"
+  if windows_eval "$fakebin" "fm_session_lock_owned_by_self '$dir/state'"; then
+    fail 'Windows session claimed a competing live owner'
+  fi
+  windows_eval "$fakebin" "fm_session_lock_foreign_owner_live '$dir/state'" || fail 'Windows competing session was not live'
+  for pid in 700 600 500 401 402 403 999; do
+    printf '%s\n' "$pid" > "$dir/state/.lock"
+    case "$pid" in 700|600) expected=held ;; 999) expected=stale ;; *) expected=unknown ;; esac
+    got=$(windows_eval "$fakebin" "fm_session_lock_inspect '$dir/state'; printf '%s' \"\$FM_LOCK_INSPECT_STATE\"")
+    [ "$got" = "$expected" ] || fail "Windows PID $pid: expected $expected, got $got"
+  done
+  rc=0
+  FM_TEST_WINDOWS_QUERY_FAIL=1 windows_eval "$fakebin" 'fm_harness_pid_alive 700' || rc=$?
+  [ "$rc" = 2 ] || fail 'PowerShell startup failure was treated as a missing process'
+  if FM_TEST_WINDOWS_QUERY_FAIL=1 windows_eval "$fakebin" 'fm_session_lock_anchor_pid'; then
+    fail 'Windows query failure still produced an anchor'
+  fi
+  pass 'Windows native PID ancestry, nearest owner, competing owner, and unknown-versus-absent process evidence'
+}
+
+test_windows_native_session_processes() {
+  case "$OSTYPE" in msys*|cygwin*|win32*) ;; *) echo 'skip: native Windows session process test requires Windows'; return ;; esac
+  command -v node >/dev/null || fail 'native Windows session test requires node'
+  local out rc=0
+  out=$(FM_WINDOWS_TEST_ROOT="$(cygpath -m "$TMP_ROOT/native windows")" \
+    FM_WINDOWS_TEST_LIB="$(cygpath -m "$LIB")" \
+    FM_WINDOWS_TEST_LOCK="$(cygpath -m "$ROOT/bin/fm-lock.sh")" \
+    node --input-type=commonjs 2>&1 <<'JS'
+const {spawnSync} = require('node:child_process');
+const {mkdirSync, writeFileSync} = require('node:fs');
+const path = require('node:path');
+const root = process.env.FM_WINDOWS_TEST_ROOT;
+const script = path.join(root, 'node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js');
+mkdirSync(path.dirname(script), {recursive: true});
+// A node -e/stdin process must not become Pi even with inherited markers.
+let probe = spawnSync('bash', ['-c', '. "$FM_WINDOWS_TEST_LIB"; fm_harness_pid_alive "$1"', '_', String(process.pid)],
+  {encoding: 'utf8', timeout: 20000, env: {...process.env, PI_CODING_AGENT: 'true'}});
+if (probe.status !== 1) throw new Error(`ordinary node accepted: ${probe.status} ${probe.stderr}`);
+writeFileSync(script, `
+const {spawnSync} = require('node:child_process');
+const {readFileSync,writeFileSync,mkdirSync} = require('node:fs');
+const path = require('node:path');
+const home = process.env.FM_WINDOWS_TEST_ROOT;
+const env = {...process.env, FM_HOME: home, FM_STATE_OVERRIDE: path.join(home, 'state'),
+  PI_CODING_AGENT: 'false', MSYS: 'winsymlinks:nativestrict'};
+delete env.CLAUDE_CODE_SESSION_ID;
+delete env.CLAUDE_PID;
+function bash(command, args = []) {
+  const result = spawnSync('bash', ['-c', command, '_', ...args], {encoding:'utf8', timeout:30000, env});
+  if (result.error) throw new Error(result.error.message + '\\n' + result.stdout + '\\n' + result.stderr);
+  return result;
+}
+let result = bash('. "$FM_WINDOWS_TEST_LIB"; fm_session_lock_anchor_pid');
+if (result.status !== 0 || result.stdout.trim() !== String(process.pid))
+  throw new Error('wrong native anchor: ' + JSON.stringify(result));
+// A non-tail-exec Bash child has a dead native exec-stub parent on MSYS.
+// The MSYS /proc chain must bridge it without depending on timing or markers.
+mkdirSync(home, {recursive:true});
+writeFileSync(path.join(home, 'probe.sh'), '. "$FM_WINDOWS_TEST_LIB"\\nfm_session_lock_anchor_pid\\n');
+result = bash('for attempt in 1 2; do bash "$FM_HOME/probe.sh"; done');
+if (result.status !== 0 || result.stdout.trim() !== [process.pid, process.pid].join('\\n'))
+  throw new Error('nested MSYS exec ancestry lost the session: ' + JSON.stringify(result));
+if (process.argv[2] === 'competitor') {
+  result = bash('bash "$FM_WINDOWS_TEST_LOCK"');
+  if (result.status !== 1 || !result.stderr.includes('another live firstmate session'))
+    throw new Error('competing owner not refused: ' + JSON.stringify(result));
+  process.exit(0);
+}
+for (let i=0; i<2; i++) {
+  result = bash('bash "$FM_WINDOWS_TEST_LOCK"');
+  if (result.status !== 0) throw new Error('lock failed: ' + JSON.stringify(result));
+  if (readFileSync(path.join(home, 'state/.lock'), 'utf8').trim() !== String(process.pid))
+    throw new Error('lock did not retain native PID');
+}
+result = spawnSync(process.execPath, [__filename, 'competitor'], {encoding:'utf8', timeout:60000, env});
+if (result.status !== 0) throw new Error('competitor test failed: ' + result.stderr);
+if (readFileSync(path.join(home, 'state/.lock'), 'utf8').trim() !== String(process.pid))
+  throw new Error('competitor changed lock');
+// A live non-agent PID is uncertain, not stale: preserve it rather than steal.
+writeFileSync(path.join(home, 'state/.lock'), process.env.FM_WINDOWS_NONAGENT_PID + '\\n');
+result = bash('bash "$FM_WINDOWS_TEST_LOCK"');
+if (result.status !== 1 || !result.stderr.includes('cannot verify Windows session-lock owner'))
+  throw new Error('uncertain live owner not refused: ' + JSON.stringify(result));
+`);
+probe = spawnSync(process.execPath, [script], {encoding:'utf8', timeout:180000,
+  env:{...process.env, FM_WINDOWS_NONAGENT_PID:String(process.pid)}});
+if (probe.status !== 0) throw new Error(`native fixture failed: ${probe.status}\n${probe.stdout}\n${probe.stderr}`);
+JS
+  ) || rc=$?
+  [ "$rc" = 0 ] || fail "native Windows session process checks: $out"
+  pass 'native Windows CIM handles spaced script paths, ignores inherited markers, confirms ownership, and refuses competitors and uncertain live PIDs'
+}
+
+test_windows_session_process_table
+test_windows_native_session_processes
+[ "${1:-}" != --windows ] || exit 0
+
 test_version_named_session_is_identified_on_both_platforms
 test_harness_at_namespace_pid1_is_examined
 test_ordinary_paths_are_never_harness_processes
@@ -1106,6 +1262,11 @@ test_harness_beyond_a_gap_never_owns_the_lock
 test_competing_version_named_session_is_seen_as_live
 test_same_session_id_owns_a_recycled_background_chain
 test_anchor_pid_is_the_model_loop_process_only_for_a_trusted_id
+case "$OSTYPE" in
+  msys*|cygwin*|win32*)
+    echo 'skip: POSIX renamed-Bash process fixtures require Linux/macOS; native Windows process fixtures ran above'
+    exit 0 ;;
+esac
 test_e2e_version_named_session_claims_the_home
 test_e2e_daemon_parented_session_claims_the_home
 test_e2e_daemon_parented_version_named_session_keeps_its_lock

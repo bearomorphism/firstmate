@@ -122,6 +122,14 @@ Untracked files and directories whose names begin with `scratchpad` are also git
 
 - Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, while persistent-secondmate recovery is owned by `secondmate-provisioning`.
 
+### Native Windows session identity
+
+`bin/fm-session-lock-lib.sh` uses MSYS `/proc` parent mappings and Windows CIM process information instead of the unsupported Git Bash `ps -o` interface.
+PowerShell must be available as `powershell.exe`; missing or unreadable process evidence does not authorize taking over an existing session.
+Git Bash must also support real symbolic links for the existing shared-lock implementation: launch the agent with `MSYS=winsymlinks:nativestrict`, retaining any other required MSYS options.
+The Windows account must already have permission to create those links; this setting does not grant that permission.
+Session-identity verification and its limits are recorded in [runtime backend verification](verification/runtime-backends.md#native-windows-session-identity).
+
 ## Orchestrator behavior (AGENTS.md)
 
 The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md).

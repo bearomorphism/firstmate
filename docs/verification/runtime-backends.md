@@ -6,6 +6,34 @@ This record contains reusable version-scoped evidence for active runtime guarant
 The backend guides own current setup, safety boundaries, and limitations.
 Exact task chronology, branch names, temporary homes, local paths, process ids, thread ids, and delivery transcripts remain in private reports or PR evidence.
 
+## Native Windows session identity
+
+Verified on 2026-10-01 with Windows 11, Git for Windows 2.55.0.windows.5, Node v24.17.0, and Pi 0.87.1.
+The session-identity owner is `bin/fm-session-lock-lib.sh`; [configuration](../configuration.md#native-windows-session-identity) owns the Windows prerequisites.
+
+Run the targeted process-table and native subprocess checks with:
+
+```sh
+bash tests/fm-session-lock-ancestry.test.sh --windows
+```
+
+Observed output:
+
+```text
+ok - Windows native PID ancestry, nearest owner, competing owner, and unknown-versus-absent process evidence
+ok - native Windows CIM handles spaced script paths, ignores inherited markers, confirms ownership, and refuses competitors and uncertain live PIDs
+```
+
+The native subprocess fixture also exercises non-tail-exec Bash children, whose Windows parent can be a departed MSYS exec stub, and uses real native PIDs in isolated session locks.
+The default suite additionally passed its existing macOS/Linux process-table cases; POSIX renamed-Bash end-to-end fixtures require their own platforms and were not run on Windows.
+The following read-only probe was repeated three times inside the real Pi session, each time printing `session identity and liveness: verified`:
+
+```sh
+bash -c '. bin/fm-session-lock-lib.sh; pid=$(fm_session_lock_anchor_pid) && fm_harness_pid_alive "$pid" && printf "session identity and liveness: verified\\n"'
+```
+
+This evidence covers session identity and ownership refusal, not worker launch, backend liveness, complete Pi startup, or other installed harnesses on Windows.
+
 ## Harness detection precedence
 
 Firstmate's own harness comes from two kinds of evidence, and `bin/fm-harness.sh` owns how they combine: an environment marker names its harness, and the nearest harness process in the parent chain proves who owns the process tree.

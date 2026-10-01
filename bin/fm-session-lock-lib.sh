@@ -22,7 +22,106 @@ _FM_SESSION_LOCK_LIB_DIR=${BASH_SOURCE[0]%/*}
 [ "$_FM_SESSION_LOCK_LIB_DIR" != "${BASH_SOURCE[0]}" ] || _FM_SESSION_LOCK_LIB_DIR=.
 # shellcheck source=bin/fm-cursor-lib.sh
 . "${_FM_SESSION_LOCK_LIB_DIR:-/}/fm-cursor-lib.sh"
+# Keep the helper relative to this library, never to a caller's current home.
+_FM_SESSION_WINDOWS_HELPER="$_FM_SESSION_LOCK_LIB_DIR/fm-session-process-windows.ps1"
 unset _FM_SESSION_LOCK_LIB_DIR
+
+# Git Bash/Cygwin ps lacks the POSIX -o interface and its PIDs are not native
+# Windows PIDs. Session locks on Windows always use native PIDs from CIM;
+# ordinary shell/process locks in fm-wake-lib.sh retain their existing namespace.
+fm_session_lock_windows() {
+  case "$OSTYPE" in msys*|cygwin*|win32*) return 0 ;; esac
+  return 1
+}
+
+fm_session_windows_msys_ancestry() {
+  local pid=$$ native_pid parent chain='' _hop
+  # MSYS exec replaces a native process while retaining its MSYS PID. Its
+  # child's Windows parent can consequently be a dead exec stub. Read the
+  # kernel-maintained MSYS parent chain first, then map those PIDs to native
+  # PIDs; CIM owns the continuation beyond the MSYS/native boundary.
+  for _hop in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    IFS= read -r native_pid < "/proc/$pid/winpid" || return 2
+    IFS= read -r parent < "/proc/$pid/ppid" || return 2
+    case "$native_pid:$parent" in *[!0-9:]*|:*|*:) return 2 ;; esac
+    [ "$native_pid" -gt 0 ] || return 2
+    case ",$chain," in *",$native_pid,"*) return 2 ;; esac
+    chain="${chain:+$chain,}$native_pid"
+    if [ "$parent" -le 1 ]; then
+      printf '%s\n' "$chain"
+      return 0
+    fi
+    pid=$parent
+  done
+  return 2
+}
+
+fm_session_windows_processes() {  # <ancestry|process> [native-pid]
+  local helper=$_FM_SESSION_WINDOWS_HELPER out rc pid=${2:-0} ancestry=
+  if [ "$1" = ancestry ]; then
+    ancestry=$(fm_session_windows_msys_ancestry) || return 2
+    pid=${ancestry%%,*}
+  fi
+  if command -v cygpath >/dev/null 2>&1; then
+    helper=$(cygpath -w "$helper") || return 2
+  fi
+  out=$(powershell.exe -NoLogo -NoProfile -NonInteractive -File "$helper" \
+    -Mode "$1" -ProcessId "$pid" -MsysAncestry "$ancestry") || {
+    rc=$?
+    [ "$rc" -eq 3 ] && return 1
+    return 2
+  }
+  printf '%s\n' "${out//$'\r'/}"
+}
+
+# Windows evidence is narrower than a search of the full command line:
+# exact executable names, or a known interpreter's actual absolute script path.
+# In particular, node -e and prompts mentioning Pi must never become owners.
+fm_windows_harness_process_matches() {  # <executable> <script>
+  local executable=$1 script=$2 base name
+  FM_HARNESS_IS_CLAUDE=0
+  executable=$(printf '%s' "$executable" | tr '[:upper:]' '[:lower:]')
+  script=$(printf '%s' "$script" | tr '[:upper:]' '[:lower:]')
+  base=${executable##*/}
+  base=${base%.exe}
+  for name in "${FM_HARNESS_NAMES[@]}"; do
+    if [ "$base" = "$name" ]; then
+      [ "$name" != claude ] || FM_HARNESS_IS_CLAUDE=1
+      return 0
+    fi
+  done
+  case "$base" in
+    node|python|python3)
+      case "$script" in
+        */node_modules/@earendil-works/pi-coding-agent/dist/cli.js|\
+        */node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js)
+          return 0 ;;
+      esac
+      fm_cursor_path_is_cursor "$script" && return 0
+      ;;
+    *) fm_cursor_path_is_cursor "${executable%.exe}" && return 0 ;;
+  esac
+  return 1
+}
+
+fm_windows_harness_ancestry_pids() {
+  local rows pid _parent executable script extending=0 printed=0
+  rows=$(fm_session_windows_processes ancestry) || return 1
+  while IFS='|' read -r pid _parent executable script; do
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    if fm_windows_harness_process_matches "$executable" "$script"; then
+      printf '%s\n' "$pid"
+      printed=1
+      [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || break
+      extending=1
+    elif [ "$extending" -eq 1 ]; then
+      break
+    fi
+  done <<EOF
+$rows
+EOF
+  [ "$printed" -eq 1 ]
+}
 
 # Known harness command names; extend when a new adapter is verified. omp is
 # anchored exactly like pi: its process name is the bare word `omp` (verified,
@@ -117,6 +216,10 @@ fm_harness_process_matches() {  # <comm> <args>
 # session cannot be read off the ancestry at all, so the whole contiguous run is
 # reported and the callers below decide what they need from it.
 fm_harness_ancestry_pids() {
+  if fm_session_lock_windows; then
+    fm_windows_harness_ancestry_pids
+    return $?
+  fi
   local pid=$$ comm args extending=0 printed=0
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
@@ -165,7 +268,15 @@ EOF
 
 # True if $1 is a live process that looks like a verified harness.
 fm_harness_pid_alive() {
-  local pid=$1 comm args
+  local pid=$1 comm args row actual _parent script
+  case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+  if fm_session_lock_windows; then
+    row=$(fm_session_windows_processes process "$pid") || return $?
+    IFS='|' read -r actual _parent comm script <<< "$row"
+    [ "$actual" = "$pid" ] || return 2
+    fm_windows_harness_process_matches "$comm" "$script"
+    return $?
+  fi
   kill -0 "$pid" 2>/dev/null || return 1
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
   args=$(ps -o args= -p "$pid" 2>/dev/null)
@@ -208,9 +319,13 @@ fm_session_lock_trusted_session_id() {  # [<ancestry-pids>]
   fi
   while IFS= read -r pid; do
     [ "$pid" = "$claude_pid" ] || continue
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-    args=$(ps -o args= -p "$pid" 2>/dev/null)
-    fm_harness_process_matches "$comm" "$args" || return 1
+    if fm_session_lock_windows; then
+      fm_harness_pid_alive "$pid" || return 1
+    else
+      comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+      args=$(ps -o args= -p "$pid" 2>/dev/null)
+      fm_harness_process_matches "$comm" "$args" || return 1
+    fi
     [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || return 1
     printf '%s\n' "$id"
     return 0
@@ -336,7 +451,7 @@ FM_LOCK_INSPECT_STATE=unknown
 FM_LOCK_INSPECT_PID=
 FM_LOCK_INSPECT_LIVE_HARNESS=unknown
 fm_session_lock_inspect() {  # <state>
-  local state=$1 lock pid
+  local state=$1 lock pid row rc actual _parent executable script
   # shellcheck disable=SC2034 # Output globals, read by lock status and inbox ready.
   FM_LOCK_INSPECT_STATE=unknown
   # shellcheck disable=SC2034 # Output globals, read by lock status and inbox ready.
@@ -366,6 +481,25 @@ fm_session_lock_inspect() {  # <state>
       return 0
       ;;
   esac
+  if fm_session_lock_windows; then
+    if row=$(fm_session_windows_processes process "$pid"); then
+      IFS='|' read -r actual _parent executable script <<< "$row"
+      [ "$actual" = "$pid" ] || return 0
+      if fm_windows_harness_process_matches "$executable" "$script"; then
+        FM_LOCK_INSPECT_STATE=held
+        FM_LOCK_INSPECT_LIVE_HARNESS=true
+      else
+        FM_LOCK_INSPECT_LIVE_HARNESS=false
+      fi
+    else
+      rc=$?
+      if [ "$rc" -eq 1 ]; then
+        FM_LOCK_INSPECT_STATE=stale
+        FM_LOCK_INSPECT_LIVE_HARNESS=false
+      fi
+    fi
+    return 0
+  fi
   if kill -0 "$pid" 2>/dev/null; then
     if fm_harness_pid_alive "$pid"; then
       FM_LOCK_INSPECT_STATE=held
